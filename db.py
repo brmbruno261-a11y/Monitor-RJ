@@ -39,6 +39,25 @@ CREATE TABLE IF NOT EXISTS casos (
 CREATE INDEX IF NOT EXISTS idx_casos_data ON casos (data_publicacao);
 CREATE INDEX IF NOT EXISTS idx_casos_tipo ON casos (tipo);
 CREATE INDEX IF NOT EXISTS idx_casos_uf ON casos (uf);
+
+-- cache de enriquecimento por CNPJ (RFB Dados Abertos, via BrasilAPI)
+CREATE TABLE IF NOT EXISTS empresas_cnpj (
+    cnpj                TEXT PRIMARY KEY,   -- somente dígitos
+    razao_social         TEXT,
+    nome_fantasia        TEXT,
+    cnae_codigo          TEXT,
+    cnae_descricao       TEXT,
+    setor                TEXT,               -- derivado do CNAE (ver cnae.py)
+    situacao_cadastral    TEXT,
+    uf                  TEXT,
+    municipio            TEXT,
+    porte               TEXT,
+    capital_social        REAL,
+    data_abertura        TEXT,
+    atualizado_em        TEXT,
+    raw_json             TEXT,
+    erro                TEXT                -- guarda mensagem se a consulta falhou
+);
 """
 
 
@@ -116,3 +135,67 @@ def last_data_coleta() -> str | None:
     with get_conn() as conn:
         row = conn.execute("SELECT MAX(data_coleta) FROM casos").fetchone()
         return row[0] if row else None
+
+
+# ------------------------------------------------------------------ enriquecimento CNPJ (RFB)
+
+def upsert_empresas(registros: Iterable[dict]) -> int:
+    registros = list(registros)
+    if not registros:
+        return 0
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO empresas_cnpj (cnpj, razao_social, nome_fantasia, cnae_codigo,
+                                        cnae_descricao, setor, situacao_cadastral, uf,
+                                        municipio, porte, capital_social, data_abertura,
+                                        atualizado_em, raw_json, erro)
+            VALUES (:cnpj, :razao_social, :nome_fantasia, :cnae_codigo, :cnae_descricao,
+                    :setor, :situacao_cadastral, :uf, :municipio, :porte, :capital_social,
+                    :data_abertura, :atualizado_em, :raw_json, :erro)
+            ON CONFLICT(cnpj) DO UPDATE SET
+                razao_social=excluded.razao_social,
+                nome_fantasia=excluded.nome_fantasia,
+                cnae_codigo=excluded.cnae_codigo,
+                cnae_descricao=excluded.cnae_descricao,
+                setor=excluded.setor,
+                situacao_cadastral=excluded.situacao_cadastral,
+                uf=excluded.uf,
+                municipio=excluded.municipio,
+                porte=excluded.porte,
+                capital_social=excluded.capital_social,
+                data_abertura=excluded.data_abertura,
+                atualizado_em=excluded.atualizado_em,
+                raw_json=excluded.raw_json,
+                erro=excluded.erro
+            """,
+            [
+                {**r, "raw_json": json.dumps(r.get("raw_json"), ensure_ascii=False) if not isinstance(r.get("raw_json"), str) else r.get("raw_json")}
+                for r in registros
+            ],
+        )
+        return cur.rowcount
+
+
+def fetch_empresas() -> dict[str, dict]:
+    """Devolve um dict cnpj(só dígitos) -> registro, para fazer join rápido em memória."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM empresas_cnpj").fetchall()
+        return {r["cnpj"]: dict(r) for r in rows}
+
+
+def cnpjs_pendentes_enriquecimento(limite: int = 200) -> list[str]:
+    """CNPJs que aparecem em `casos` mas ainda não têm registro em `empresas_cnpj`."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT replace(replace(replace(c.cnpj,'.',''),'/',''),'-','') AS cnpj_digitos
+            FROM casos c
+            WHERE c.cnpj IS NOT NULL AND c.cnpj != ''
+              AND NOT EXISTS (SELECT 1 FROM empresas_cnpj e WHERE e.cnpj = replace(replace(replace(c.cnpj,'.',''),'/',''),'-',''))
+            LIMIT ?
+            """,
+            (limite,),
+        ).fetchall()
+        return [r["cnpj_digitos"] for r in rows]

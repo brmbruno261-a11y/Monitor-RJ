@@ -1,19 +1,31 @@
 """
 app.py — Monitor RJ: Recuperação Judicial, Extrajudicial e Falências
 
+Fontes:
+  - Fluxo:   DJEN (comunica.pje.jus.br), DataJud (CNJ), CVM (companhias abertas)
+  - Estoque: RFB Dados Abertos de CNPJ (via BrasilAPI), para enriquecer cada
+             caso com setor real (CNAE), UF/município e situação cadastral
+  - Malha geográfica: IBGE (mapa coroplético por UF)
+
 Rode com:  streamlit run app.py
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import calendar
+import os
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 import db
-import scraper
+import fonte_cvm as cvm
+import fonte_datajud as datajud
+import fonte_djen as djen
+import fonte_ibge_geo as ibge_geo
+import fonte_rfb_cnpj as rfb_cnpj
 import seed_sample_data
 
 st.set_page_config(
@@ -39,10 +51,41 @@ def carregar_dados() -> pd.DataFrame:
     df = pd.DataFrame(registros)
     if df.empty:
         return df
+
+    # junta com o cache de enriquecimento RFB (estoque), quando disponível:
+    # setor/UF reais (por CNAE e endereço) têm prioridade sobre a heurística de texto
+    empresas = db.fetch_empresas()
+    if empresas:
+
+        def _enriquecido(row, campo_df, campo_empresa):
+            cnpj_d = "".join(c for c in str(row.get("cnpj") or "") if c.isdigit())
+            emp = empresas.get(cnpj_d)
+            if emp and emp.get(campo_empresa):
+                return emp[campo_empresa]
+            return row.get(campo_df)
+
+        df["setor"] = df.apply(lambda r: _enriquecido(r, "setor", "setor"), axis=1)
+        df["uf"] = df.apply(lambda r: _enriquecido(r, "uf", "uf"), axis=1)
+        df["razao_social_rfb"] = df.apply(lambda r: _enriquecido(r, "empresa", "razao_social"), axis=1)
+        df["porte"] = df.apply(lambda r: _enriquecido(r, "porte", "porte"), axis=1)
+        df["situacao_cadastral"] = df["cnpj"].apply(
+            lambda c: (empresas.get("".join(ch for ch in str(c or "") if ch.isdigit())) or {}).get("situacao_cadastral")
+        )
+    else:
+        df["porte"] = None
+
     df["data_publicacao"] = pd.to_datetime(df["data_publicacao"], errors="coerce")
     df = df.dropna(subset=["data_publicacao"])
     df["ano_mes"] = df["data_publicacao"].dt.to_period("M").dt.to_timestamp()
     return df
+
+
+@st.cache_data(ttl=6 * 60 * 60)
+def carregar_malha():
+    try:
+        return ibge_geo.malha_estados_brasil()
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def formatar_delta(atual: int, anterior: int) -> str:
@@ -53,6 +96,28 @@ def formatar_delta(atual: int, anterior: int) -> str:
     return f"{sinal}{pct:.1f}% vs período anterior"
 
 
+def opcoes_periodo(df: pd.DataFrame) -> list[str]:
+    datas = df["data_publicacao"].dropna()
+    if datas.empty:
+        return ["Tudo"]
+    trimestres = sorted({(d.year, (d.month - 1) // 3 + 1) for d in datas}, reverse=True)
+    labels = [f"{q}ºT/{str(y)[2:]}" for y, q in trimestres]
+    return ["Tudo"] + labels
+
+
+def periodo_para_datas(label: str) -> tuple[date, date] | None:
+    if label == "Tudo":
+        return None
+    q_str, y_str = label.replace("º", "").split("T/")
+    q, y = int(q_str), 2000 + int(y_str)
+    mes_ini = (q - 1) * 3 + 1
+    mes_fim = mes_ini + 2
+    ini = date(y, mes_ini, 1)
+    ultimo_dia = calendar.monthrange(y, mes_fim)[1]
+    fim = date(y, mes_fim, ultimo_dia)
+    return ini, fim
+
+
 # ------------------------------------------------------------------ sidebar
 
 with st.sidebar:
@@ -60,10 +125,8 @@ with st.sidebar:
     st.caption("Recuperação Judicial · Extrajudicial · Falências")
 
     st.subheader("Dados")
-    total_atual = db.count_casos()
-    ultima_coleta = db.last_data_coleta()
-    st.metric("Casos no banco", total_atual)
-    st.caption(f"Última coleta: {ultima_coleta or '—'}")
+    st.metric("Casos no banco", db.count_casos())
+    st.caption(f"Última coleta: {db.last_data_coleta() or '—'}")
 
     if st.button("🧪 Carregar dados de exemplo", use_container_width=True,
                   help="Popula o banco com dados sintéticos para você ver o dashboard funcionando antes de coletar dados reais."):
@@ -72,32 +135,93 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    with st.expander("🔄 Atualizar com dados reais (DJEN)"):
-        st.caption(
-            "Busca publicações públicas no Diário de Justiça Eletrônico Nacional "
-            "(comunica.pje.jus.br) contendo os termos abaixo."
+    st.divider()
+    st.subheader("🔄 Coletar dados reais")
+
+    with st.expander("📰 DJEN — publicações judiciais"):
+        st.caption("comunica.pje.jus.br — busca por palavra-chave nas publicações de todos os tribunais.")
+        termos_djen = st.text_area(
+            "Termos", value="recuperação judicial\nrecuperação extrajudicial\nfalência",
+            height=80, key="termos_djen",
         )
-        termos_txt = st.text_area(
-            "Termos de busca (um por linha)",
-            value="recuperação judicial\nrecuperação extrajudicial\nfalência",
-            height=90,
-        )
-        dias_atras = st.slider("Coletar últimos N dias", 1, 180, 30)
-        if st.button("Buscar agora", use_container_width=True, type="primary"):
-            termos = [t.strip() for t in termos_txt.splitlines() if t.strip()]
-            with st.spinner("Consultando o DJEN... isso pode levar alguns minutos"):
+        dias_djen = st.slider("Últimos N dias", 1, 180, 30, key="dias_djen")
+        if st.button("Buscar no DJEN", use_container_width=True, key="btn_djen"):
+            termos = [t.strip() for t in termos_djen.splitlines() if t.strip()]
+            with st.spinner("Consultando o DJEN..."):
                 try:
-                    registros = scraper.collect(termos=termos, dias_atras=dias_atras)
+                    registros = djen.collect(termos=termos, dias_atras=dias_djen)
                     if registros:
                         db.upsert_casos(registros)
-                        st.success(f"{len(registros)} publicações coletadas e classificadas como RJ/Extrajudicial/Falência.")
+                        st.success(f"{len(registros)} publicações coletadas.")
                     else:
-                        st.warning(
-                            "Nenhum registro retornado. A API pública do DJEN pode ter mudado o "
-                            "formato — veja as notas em scraper.py (função debug_ping) para diagnosticar."
-                        )
+                        st.warning("Nenhum registro retornado.")
                 except Exception as e:
-                    st.error(f"Falha ao coletar: {e}")
+                    st.error(f"Falha: {e}")
+            st.cache_data.clear()
+            st.rerun()
+
+    with st.expander("⚖️ DataJud — processos estruturados (CNJ)"):
+        st.caption(
+            "Requer API Key do DataJud. Veja como obter em "
+            "https://datajud-wiki.cnj.jus.br/api-publica/acesso/"
+        )
+        api_key_input = st.text_input(
+            "DATAJUD_API_KEY", value=os.environ.get("DATAJUD_API_KEY", ""), type="password", key="datajud_key"
+        )
+        tribunais_sel = st.multiselect(
+            "Tribunais", datajud.TRIBUNAIS, default=datajud.TRIBUNAIS[:5], key="datajud_tribunais"
+        )
+        if st.button("Buscar no DataJud", use_container_width=True, key="btn_datajud"):
+            with st.spinner("Consultando o DataJud (pode demorar, um tribunal por vez)..."):
+                try:
+                    registros = datajud.collect(tribunais=tribunais_sel, api_key=api_key_input or None)
+                    if registros:
+                        db.upsert_casos(registros)
+                        st.success(f"{len(registros)} processos coletados.")
+                    else:
+                        st.warning("Nenhum registro retornado.")
+                except Exception as e:
+                    st.error(f"Falha: {e}")
+            st.cache_data.clear()
+            st.rerun()
+
+    with st.expander("🏦 CVM — companhias abertas"):
+        st.caption("Fatos Relevantes e comunicados de RJ/falência de empresas com capital aberto.")
+        anos_sel = st.multiselect(
+            "Anos", list(range(2018, date.today().year + 1)),
+            default=[date.today().year, date.today().year - 1], key="cvm_anos",
+        )
+        if st.button("Buscar na CVM", use_container_width=True, key="btn_cvm"):
+            with st.spinner("Baixando e filtrando documentos da CVM..."):
+                try:
+                    registros = cvm.collect(anos=anos_sel)
+                    if registros:
+                        db.upsert_casos(registros)
+                        st.success(f"{len(registros)} documentos coletados.")
+                    else:
+                        st.warning("Nenhum registro retornado.")
+                except Exception as e:
+                    st.error(f"Falha: {e}")
+            st.cache_data.clear()
+            st.rerun()
+
+    with st.expander("🏢 RFB — enriquecer CNPJs (estoque)"):
+        st.caption(
+            "Consulta cada CNPJ encontrado nos casos na base da Receita (via BrasilAPI), "
+            "trazendo setor real (CNAE), UF/município e situação cadastral."
+        )
+        pendentes = db.cnpjs_pendentes_enriquecimento(limite=500)
+        st.caption(f"{len(pendentes)} CNPJs ainda não enriquecidos (mostrando até 500 por vez).")
+        qtd = st.slider("Quantos enriquecer agora", 1, max(len(pendentes), 1), min(20, max(len(pendentes), 1)), key="qtd_enriq")
+        if st.button("Enriquecer agora", use_container_width=True, key="btn_rfb", disabled=not pendentes):
+            with st.spinner("Consultando a Receita Federal via BrasilAPI..."):
+                try:
+                    resultados = rfb_cnpj.enriquecer_lote(pendentes[:qtd])
+                    db.upsert_empresas(resultados)
+                    ok = sum(1 for r in resultados if not r.get("erro"))
+                    st.success(f"{ok}/{len(resultados)} CNPJs enriquecidos com sucesso.")
+                except Exception as e:
+                    st.error(f"Falha: {e}")
             st.cache_data.clear()
             st.rerun()
 
@@ -112,39 +236,68 @@ if df_all.empty:
     st.title("📊 Monitor RJ — Recuperação Judicial, Extrajudicial e Falências")
     st.info(
         "Nenhum dado no banco ainda. Use **🧪 Carregar dados de exemplo** na barra lateral "
-        "para ver o dashboard funcionando, ou **🔄 Atualizar com dados reais (DJEN)** para "
-        "coletar publicações reais."
+        "para ver o dashboard funcionando, ou as seções **🔄 Coletar dados reais** para "
+        "buscar em DJEN, DataJud ou CVM."
     )
     st.stop()
 
-# ------------------------------------------------------------------ filtros
+# ------------------------------------------------------------------ barra de filtros (topo)
 
-st.sidebar.subheader("Filtros")
-periodo_min = df_all["data_publicacao"].min().date()
-periodo_max = df_all["data_publicacao"].max().date()
-periodo = st.sidebar.date_input(
-    "Período (data de publicação)",
-    value=(max(periodo_min, periodo_max - timedelta(days=365)), periodo_max),
-    min_value=periodo_min,
-    max_value=periodo_max,
-)
-tipos_sel = st.sidebar.multiselect("Tipo", sorted(df_all["tipo"].dropna().unique()), default=None)
-ufs_sel = st.sidebar.multiselect("UF", sorted(df_all["uf"].dropna().unique()), default=None)
-setores_sel = st.sidebar.multiselect("Setor", sorted(df_all["setor"].dropna().unique()), default=None)
-busca = st.sidebar.text_input("Buscar empresa / texto")
+DEFAULTS_FILTRO = {
+    "f_periodo": "Tudo", "f_uf": "Brasil", "f_porte": "Todos",
+    "f_fonte": "Todas", "f_tipo": "Todos", "f_busca": "",
+}
+for k, v in DEFAULTS_FILTRO.items():
+    st.session_state.setdefault(k, v)
 
+
+def _limpar_filtros():
+    for k, v in DEFAULTS_FILTRO.items():
+        st.session_state[k] = v
+
+
+with st.container(border=True):
+    fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1, 1, 1, 0.8])
+
+    with fc1:
+        opcoes_per = opcoes_periodo(df_all)
+        if st.session_state["f_periodo"] not in opcoes_per:
+            st.session_state["f_periodo"] = "Tudo"
+        st.selectbox("Período", opcoes_per, key="f_periodo")
+    with fc2:
+        opcoes_uf = ["Brasil"] + sorted(df_all["uf"].dropna().unique().tolist())
+        st.selectbox("UF", opcoes_uf, key="f_uf")
+    with fc3:
+        opcoes_porte = ["Todos"] + sorted(df_all["porte"].dropna().unique().tolist()) if "porte" in df_all.columns else ["Todos"]
+        st.selectbox("Porte", opcoes_porte, key="f_porte")
+    with fc4:
+        opcoes_fonte = ["Todas"] + sorted(df_all["fonte"].dropna().unique().tolist())
+        st.selectbox("Fonte (casos)", opcoes_fonte, key="f_fonte")
+    with fc5:
+        opcoes_tipo = ["Todos"] + sorted(df_all["tipo"].dropna().unique().tolist())
+        st.selectbox("Tipo (casos)", opcoes_tipo, key="f_tipo")
+    with fc6:
+        st.markdown("<div style='height:1.85em'></div>", unsafe_allow_html=True)
+        st.button("↺ Limpar", use_container_width=True, on_click=_limpar_filtros)
+
+    st.text_input("🔎 Buscar empresa ou texto", key="f_busca", placeholder="ex: Agropecuária Brasil Ltda")
+
+# aplica os filtros
 df = df_all.copy()
-if isinstance(periodo, tuple) and len(periodo) == 2:
-    ini, fim = periodo
+periodo_datas = periodo_para_datas(st.session_state["f_periodo"])
+if periodo_datas:
+    ini, fim = periodo_datas
     df = df[(df["data_publicacao"].dt.date >= ini) & (df["data_publicacao"].dt.date <= fim)]
-if tipos_sel:
-    df = df[df["tipo"].isin(tipos_sel)]
-if ufs_sel:
-    df = df[df["uf"].isin(ufs_sel)]
-if setores_sel:
-    df = df[df["setor"].isin(setores_sel)]
-if busca:
-    b = busca.lower()
+if st.session_state["f_uf"] != "Brasil":
+    df = df[df["uf"] == st.session_state["f_uf"]]
+if st.session_state["f_porte"] != "Todos":
+    df = df[df["porte"] == st.session_state["f_porte"]]
+if st.session_state["f_fonte"] != "Todas":
+    df = df[df["fonte"] == st.session_state["f_fonte"]]
+if st.session_state["f_tipo"] != "Todos":
+    df = df[df["tipo"] == st.session_state["f_tipo"]]
+if st.session_state["f_busca"]:
+    b = st.session_state["f_busca"].lower()
     df = df[
         df["empresa"].fillna("").str.lower().str.contains(b)
         | df["texto"].fillna("").str.lower().str.contains(b)
@@ -154,13 +307,11 @@ if busca:
 
 st.title("📊 Monitor RJ — Recuperação Judicial, Extrajudicial e Falências")
 st.caption(
-    f"{len(df)} casos no filtro atual · período {periodo[0] if isinstance(periodo, tuple) else periodo_min} "
-    f"a {periodo[1] if isinstance(periodo, tuple) else periodo_max}"
+    f"{len(df)} casos no filtro atual · fontes: {', '.join(sorted(df['fonte'].dropna().unique())) or '—'}"
 )
 
-# período anterior de mesmo tamanho, para calcular variação
-if isinstance(periodo, tuple) and len(periodo) == 2:
-    ini, fim = periodo
+if periodo_datas:
+    ini, fim = periodo_datas
     dias = (fim - ini).days + 1
     ini_ant, fim_ant = ini - timedelta(days=dias), ini - timedelta(days=1)
     df_ant = df_all[(df_all["data_publicacao"].dt.date >= ini_ant) & (df_all["data_publicacao"].dt.date <= fim_ant)]
@@ -200,49 +351,71 @@ if not serie.empty:
 else:
     st.caption("Sem dados suficientes para o gráfico de evolução.")
 
-# ------------------------------------------------------------------ distribuições
+# ------------------------------------------------------------------ mapa + setor
 
-colA, colB = st.columns(2)
+tab_mapa, tab_setor = st.tabs(["🗺️ Mapa por UF", "🏭 Por setor"])
 
-with colA:
-    st.subheader("Por UF")
-    por_uf = df.groupby("uf").size().reset_index(name="casos").sort_values("casos", ascending=False).head(15)
-    if not por_uf.empty:
-        fig_uf = px.bar(por_uf, x="uf", y="casos", labels={"uf": "UF", "casos": "Casos"})
-        fig_uf.update_layout(height=340)
-        st.plotly_chart(fig_uf, use_container_width=True)
-    else:
+with tab_mapa:
+    por_uf = df.groupby("uf").size().reset_index(name="casos")
+    malha = carregar_malha()
+    if "error" in malha:
+        st.warning(f"Não foi possível carregar a malha do IBGE agora ({malha['error']}). Mostrando barras por UF.")
+        if not por_uf.empty:
+            fig_uf = px.bar(por_uf.sort_values("casos", ascending=False), x="uf", y="casos")
+            st.plotly_chart(fig_uf, use_container_width=True)
+    elif por_uf.empty:
         st.caption("Sem dados de UF classificados no filtro atual.")
+    else:
+        # a malha do IBGE traz `codarea` (código IBGE da UF); mapeamos para sigla
+        for feat in malha.get("features", []):
+            codarea = feat.get("properties", {}).get("codarea")
+            feat["properties"]["sigla"] = ibge_geo.CODIGO_UF.get(str(codarea))
 
-with colB:
-    st.subheader("Por setor")
+        fig_mapa = px.choropleth(
+            por_uf, geojson=malha, locations="uf", featureidkey="properties.sigla",
+            color="casos", color_continuous_scale="Reds",
+            labels={"casos": "Casos"},
+        )
+        fig_mapa.update_geos(fitbounds="locations", visible=False)
+        fig_mapa.update_layout(height=480, margin=dict(l=0, r=0, t=0, b=0))
+        st.plotly_chart(fig_mapa, use_container_width=True)
+    st.caption(
+        "⚠️ UF é a informação real de endereço da RFB quando o CNPJ foi enriquecido "
+        "(veja '🏢 RFB — enriquecer CNPJs' na barra lateral); caso contrário, é estimada "
+        "pela sigla do tribunal."
+    )
+
+with tab_setor:
     por_setor = df.groupby("setor").size().reset_index(name="casos").sort_values("casos", ascending=False)
     if not por_setor.empty:
         fig_setor = px.pie(por_setor, names="setor", values="casos", hole=0.45)
-        fig_setor.update_layout(height=340)
+        fig_setor.update_layout(height=420)
         st.plotly_chart(fig_setor, use_container_width=True)
     else:
         st.caption("Sem dados de setor classificados no filtro atual.")
-
-st.caption(
-    "⚠️ UF e setor são inferidos por heurísticas de texto (sigla do tribunal e palavras-chave) "
-    "e podem conter erros — use como indicativo, não como fonte definitiva."
-)
+    st.caption(
+        "⚠️ Setor é o CNAE real da RFB quando o CNPJ foi enriquecido; caso contrário, é "
+        "estimado por palavras-chave no texto do caso — trate como indicativo."
+    )
 
 st.divider()
 
 # ------------------------------------------------------------------ tabela detalhada
 
 st.subheader("Casos")
-cols_tabela = ["data_publicacao", "tipo", "empresa", "cnpj", "tribunal", "uf", "setor", "numero_processo"]
+cols_disponiveis = ["data_publicacao", "tipo", "empresa", "razao_social_rfb", "cnpj", "situacao_cadastral",
+                     "tribunal", "uf", "setor", "fonte", "numero_processo"]
+cols_tabela = [c for c in cols_disponiveis if c in df.columns]
 df_tabela = df[cols_tabela].sort_values("data_publicacao", ascending=False).rename(columns={
-    "data_publicacao": "Data", "tipo": "Tipo", "empresa": "Empresa", "cnpj": "CNPJ",
-    "tribunal": "Tribunal", "uf": "UF", "setor": "Setor", "numero_processo": "Nº Processo",
+    "data_publicacao": "Data", "tipo": "Tipo", "empresa": "Empresa (extraído)",
+    "razao_social_rfb": "Razão Social (RFB)", "cnpj": "CNPJ", "situacao_cadastral": "Situação",
+    "tribunal": "Tribunal", "uf": "UF", "setor": "Setor", "fonte": "Fonte",
+    "numero_processo": "Nº Processo",
 })
 st.dataframe(df_tabela, use_container_width=True, hide_index=True, height=420)
 
-csv = df_tabela.to_csv(index=False).encode("utf-8-sig")
-st.download_button("⬇️ Baixar CSV do filtro atual", csv, file_name="monitor_rj_casos.csv", mime="text/csv")
+csv_bytes = df_tabela.to_csv(index=False).encode("utf-8-sig")
+st.download_button("⬇️ Baixar CSV do filtro atual", csv_bytes, file_name="monitor_rj_casos.csv", mime="text/csv")
 
 with st.expander("Ver texto completo de um caso"):
     if not df.empty:
